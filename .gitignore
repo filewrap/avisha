@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+modules/__pycache__/
+sites/__pycache__/
+modules/data/
+modules/accounts.json
+proxy_auth_ext/
+REPORT.md

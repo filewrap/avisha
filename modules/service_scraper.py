@@ -1,16 +1,19 @@
 import json, os, time
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 ALL_SERVICES_FILE = os.path.join(DATA_DIR, "services_all.json")
-AFFORDABLE_FILE = os.path.join(DATA_DIR, "services_affordable.json")
+TELEGRAM_SERVICES_FILE = os.path.join(DATA_DIR, "telegram_services.txt")
+TELEGRAM_JSON_FILE = os.path.join(DATA_DIR, "telegram_services.json")
 
 BALANCE = 0.01
+TELEGRAM_KEYWORDS = ["telegram", "tg"]
+RELEVANT_KEYWORDS = ["member", "bot start", "join"]
+
 
 def ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
+
 
 def scrape_services(driver):
     driver.get("https://smmpanel.one/services")
@@ -37,13 +40,28 @@ def scrape_services(driver):
                 min_order: tdTexts[4] || '',
                 max_order: tdTexts[5] || '',
                 avg_time: tdTexts[6] || '',
-                category: currentCategory,
-                cat_id: row.getAttribute('data-filter-table-category-id') || ''
+                category: currentCategory
             });
         }
         return services;
     """)
     return services
+
+
+def filter_telegram(services):
+    filtered = []
+    for svc in services:
+        name_lower = svc["name"].lower()
+        cat_lower = svc.get("category", "").lower()
+        is_telegram = any(kw in name_lower or kw in cat_lower for kw in TELEGRAM_KEYWORDS)
+        if not is_telegram:
+            continue
+        is_relevant = any(kw in name_lower for kw in RELEVANT_KEYWORDS)
+        if not is_relevant:
+            continue
+        filtered.append(svc)
+    return filtered
+
 
 def calculate_affordable(services, balance=BALANCE):
     affordable = []
@@ -56,46 +74,57 @@ def calculate_affordable(services, balance=BALANCE):
             if rate_per_1000 <= 0:
                 continue
             rate_per_unit = rate_per_1000 / 1000
-            max_affordable = int(balance / rate_per_unit)
-            if max_affordable > max_order:
-                max_affordable = max_order
-            if max_affordable >= min_order:
-                affordable.append({
-                    "id": svc["id"],
-                    "name": svc["name"],
-                    "category": svc["category"],
-                    "rate_per_1000": rate_per_1000,
-                    "rate_per_unit": round(rate_per_unit, 6),
-                    "min_order": min_order,
-                    "max_order": max_order,
-                    "max_affordable_qty": max_affordable,
-                    "max_cost": round(max_affordable * rate_per_unit, 6),
-                    "avg_time": svc["avg_time"]
-                })
-        except:
+            max_qty = int(balance / rate_per_unit)
+            if max_qty > max_order:
+                max_qty = max_order
+            if max_qty < min_order:
+                continue
+            cost = round(max_qty * rate_per_unit, 6)
+            affordable.append({
+                "id": svc["id"],
+                "name": svc["name"],
+                "category": svc["category"],
+                "rate_per_1000": rate_per_1000,
+                "rate_per_unit": rate_per_unit,
+                "min_order": min_order,
+                "max_order": max_order,
+                "max_qty": max_qty,
+                "cost": cost,
+                "avg_time": svc["avg_time"],
+            })
+        except Exception:
             pass
-    affordable.sort(key=lambda x: x["max_affordable_qty"], reverse=True)
+    affordable.sort(key=lambda x: x["max_qty"], reverse=True)
     return affordable
 
-def save_services_data(services, affordable):
+
+def save_all(services, affordable):
     ensure_data_dir()
     with open(ALL_SERVICES_FILE, "w") as f:
         json.dump(services, f, indent=2)
-    with open(AFFORDABLE_FILE, "w") as f:
+    with open(TELEGRAM_JSON_FILE, "w") as f:
         json.dump(affordable, f, indent=2)
+    _write_txt(affordable)
 
-def load_affordable_services():
-    if not os.path.exists(AFFORDABLE_FILE):
+
+def _write_txt(affordable):
+    lines = []
+    lines.append(f"{'ID':>5}  {'Service':52s}  {'$/1k':>7}  {'Qty':>5}  {'Cost':>8}  {'Min':>5}  {'Max':>7}  {'Time':>12}")
+    lines.append("-" * 120)
+    for s in affordable:
+        lines.append(
+            f"{s['id']:>5}  {s['name'][:52]:52s}  ${s['rate_per_1000']:>5.3f}  {s['max_qty']:>5}  ${s['cost']:.4f}  {s['min_order']:>5}  {s['max_order']:>7}  {s['avg_time']:>12}"
+        )
+    with open(TELEGRAM_SERVICES_FILE, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def load_telegram():
+    if not os.path.exists(TELEGRAM_JSON_FILE):
         return None
-    with open(AFFORDABLE_FILE) as f:
+    with open(TELEGRAM_JSON_FILE) as f:
         return json.load(f)
 
-def print_affordable_table(affordable):
-    print(f"\n{'#':>6} | {'Service':50s} | {'$/1k':>8} | {'Qty':>7} | {'Cost':>8} | Category")
-    print("-" * 110)
-    for i, s in enumerate(affordable):
-        name = s["name"][:50]
-        print(f"{s['id']:>6} | {name:50s} | ${s['rate_per_1000']:>6.3f} | {s['max_affordable_qty']:>7} | ${s['max_cost']:.4f} | {s['category']}")
 
 def get_service_by_id(affordable, service_id):
     for s in affordable:
@@ -103,14 +132,15 @@ def get_service_by_id(affordable, service_id):
             return s
     return None
 
-def calc_quantity_for_service(service, target_members):
-    if target_members < service["min_order"]:
+
+def calc_qty(service, target):
+    if target < service["min_order"]:
         return None
-    cost = target_members * service["rate_per_unit"]
+    cost = target * service["rate_per_unit"]
     if cost > BALANCE:
         max_by_balance = int(BALANCE / service["rate_per_unit"])
         max_by_balance = min(max_by_balance, service["max_order"])
         if max_by_balance < service["min_order"]:
             return None
         return max_by_balance
-    return target_members
+    return target

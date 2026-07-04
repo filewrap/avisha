@@ -1,169 +1,216 @@
-import signal, sys, time, json, os
+import signal, sys, time, os
 from modules.local_proxy import start_local_proxy
 from modules.signup import do_signup
 from modules.service_search import search_service
 from modules.place_order import place_order
 from modules.service_scraper import (
-    scrape_services, calculate_affordable, save_services_data,
-    load_affordable_services, print_affordable_table,
-    get_service_by_id, calc_quantity_for_service, BALANCE
+    scrape_services, filter_telegram, calculate_affordable, save_all,
+    load_telegram, get_service_by_id, calc_qty, BALANCE,
+    TELEGRAM_SERVICES_FILE,
 )
 from modules.session_manager import (
     save_cookies, try_cookie_login, mark_account_used,
-    pick_proxy, save_account_info, is_logged_in, ensure_dirs
+    pick_proxy, save_account_info, is_logged_in,
 )
 from sites.site1 import create_driver
 from proxies import PROXIES
 
 running = True
 
-def handle_sigint(sig, frame):
+
+def sigint(sig, frame):
     global running
-    print("\n[*] Stopping after current order...")
+    print("\n[!] Ctrl+C — stopping after current order...")
     running = False
 
-signal.signal(signal.SIGINT, handle_sigint)
 
-def get_user_input():
-    link = input("\nEnter link (or 'q' to quit): ").strip()
-    if link.lower() == 'q':
-        return None, None
-    quantity = input("Enter target member quantity: ").strip()
+signal.signal(signal.SIGINT, sigint)
+
+
+def log(msg):
+    ts = time.strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}")
+
+
+def refresh_services():
+    log("Refreshing services from smmpanel.one...")
+    proxy = pick_proxy(PROXIES, None)
+    driver = create_driver(proxy=proxy)
     try:
-        quantity = int(quantity)
-    except ValueError:
-        print("[!] Invalid quantity")
-        return None, None
-    return link, quantity
+        creds = do_signup(driver, "https://smmpanel.one/signup")
+        save_cookies(driver, creds["username"])
+        save_account_info(creds, proxy)
+        mark_account_used(creds["username"])
+        log(f"Scraping as {creds['username']}...")
+        all_services = scrape_services(driver)
+        tg = filter_telegram(all_services)
+        affordable = calculate_affordable(tg)
+        save_all(all_services, affordable)
+        log(f"Done: {len(all_services)} total, {len(tg)} telegram, {len(affordable)} affordable")
+        return affordable
+    finally:
+        driver.quit()
 
-def run_single_cycle(link, target_qty, last_proxy, affordable_services):
+
+def pick_best_service(affordable, target_qty):
+    for svc in affordable:
+        q = calc_qty(svc, target_qty)
+        if q is not None and q >= target_qty:
+            return svc, q
+    best = None
+    best_q = 0
+    for svc in affordable:
+        q = calc_qty(svc, target_qty)
+        if q is not None and q > best_q:
+            best = svc
+            best_q = q
+    if best is not None:
+        return best, best_q
+    return None, None
+
+
+def do_order(link, target_qty, affordable, last_proxy):
     proxy = pick_proxy(PROXIES, last_proxy)
-    print(f"\n[*] Proxy: {proxy}")
+    log(f"Proxy: {proxy}")
 
     driver = create_driver(proxy=proxy)
-    logged_in_user = None
-
     try:
-        # Step 1: Try cookie login first
-        print("[1] Trying cookie login...")
-        logged_in_user = try_cookie_login(driver, PROXIES, proxy)
-
-        if not logged_in_user:
-            # Step 2: Fresh signup
-            print("[1] Fresh signup...")
+        user = try_cookie_login(driver, PROXIES, proxy)
+        if not user:
+            log("Fresh signup...")
             creds = do_signup(driver, "https://smmpanel.one/signup")
-            logged_in_user = creds["username"]
-            save_cookies(driver, logged_in_user)
+            user = creds["username"]
+            save_cookies(driver, user)
             save_account_info(creds, proxy)
-            mark_account_used(logged_in_user)
-            print(f"[+] Account: {logged_in_user}")
+            mark_account_used(user)
+            log(f"Account: {user}")
 
         if not is_logged_in(driver):
-            print("[!] Login failed, retrying with fresh signup...")
+            log("Login failed, retrying fresh signup...")
             driver.quit()
             proxy = pick_proxy(PROXIES, proxy)
             driver = create_driver(proxy=proxy)
             creds = do_signup(driver, "https://smmpanel.one/signup")
-            logged_in_user = creds["username"]
-            save_cookies(driver, logged_in_user)
+            user = creds["username"]
+            save_cookies(driver, user)
             save_account_info(creds, proxy)
-            mark_account_used(logged_in_user)
-            print(f"[+] Account: {logged_in_user}")
+            mark_account_used(user)
+            log(f"Account: {user}")
 
-        # Step 3: Find best service for this quantity
-        best = None
-        for svc in affordable_services:
-            qty = calc_quantity_for_service(svc, target_qty)
-            if qty is not None:
-                if qty >= target_qty:
-                    best = svc
-                    break
-                if best is None or qty > calc_quantity_for_service(best, target_qty):
-                    best = svc
+        svc, qty = pick_best_service(affordable, target_qty)
+        if not svc:
+            log("No affordable service found")
+            return proxy, False
 
-        if not best:
-            print("[!] No affordable service found for this quantity")
-            return proxy
+        cost = round(qty * svc["rate_per_unit"], 4)
+        log(f"Service #{svc['id']} | {svc['name'][:50]}")
+        log(f"  Qty: {qty} | Cost: ${cost} | Rate: ${svc['rate_per_1000']}/1k")
 
-        actual_qty = calc_quantity_for_service(best, target_qty)
-        cost = round(actual_qty * best["rate_per_unit"], 4)
-        print(f"[2] Service #{best['id']}: {best['name'][:50]}")
-        print(f"    Qty: {actual_qty} | Cost: ${cost} | Rate: ${best['rate_per_1000']}/1k")
-
-        # Step 4: Search service
-        search_service(driver, best["id"])
-
-        # Step 5: Place order
-        place_order(driver, link, str(actual_qty))
+        search_service(driver, svc["id"])
+        place_order(driver, link, str(qty))
         time.sleep(2)
 
-        # Check for error messages
         error = driver.execute_script("""
-            var alerts = document.querySelectorAll('.alert-danger, .alert-warning, .swal2-popup');
-            var texts = [];
-            alerts.forEach(function(a) { texts.push(a.textContent.trim()); });
-            return texts.join(' | ');
+            var a = document.querySelectorAll('.alert-danger, .alert-warning, .swal2-popup');
+            var t = [];
+            a.forEach(function(e) { t.push(e.textContent.trim()); });
+            return t.join(' | ');
         """)
         if error:
-            print(f"[!] Server response: {error[:200]}")
+            log(f"Server: {error[:200]}")
+            return proxy, False
         else:
-            print(f"[+] Order placed successfully")
-
-        # Save cookies for reuse
-        save_cookies(driver, logged_in_user)
-        return proxy
+            log("Order placed!")
+            save_cookies(driver, user)
+            return proxy, True
 
     except Exception as e:
-        print(f"[!] Error: {e}")
-        return proxy
+        log(f"Error: {e}")
+        return proxy, False
     finally:
         try:
             driver.quit()
-        except:
+        except Exception:
             pass
+
 
 def main():
     print("=" * 60)
-    print("  Avisha - SMM Panel Order Automation")
+    print("  Avisha - Telegram Order Automation")
     print("  Ctrl+C to stop")
     print("=" * 60)
 
-    # Step 0: Load or scrape services
-    affordable = load_affordable_services()
+    affordable = load_telegram()
     if not affordable:
-        print("\n[*] No cached services. Scraping from smmpanel.one...")
-        proxy = pick_proxy(PROXIES, None)
-        driver = create_driver(proxy=proxy)
-        try:
-            creds = do_signup(driver, "https://smmpanel.one/signup")
-            save_cookies(driver, creds["username"])
-            save_account_info(creds, proxy)
-            mark_account_used(creds["username"])
-            services = scrape_services(driver)
-            affordable = calculate_affordable(services)
-            save_services_data(services, affordable)
-            print(f"[+] Scraped {len(services)} services, {len(affordable)} affordable")
-        finally:
-            driver.quit()
+        affordable = refresh_services()
     else:
-        print(f"[+] Loaded {len(affordable)} affordable services from cache")
+        log(f"Loaded {len(affordable)} telegram services from cache")
 
-    print_affordable_table(affordable)
+    print()
+    print(f"  Telegram services (affordable within ${BALANCE}):")
+    print(f"  {'ID':>5}  {'Service':42s}  {'$/1k':>7}  {'Qty':>5}  {'Cost':>8}")
+    print("  " + "-" * 75)
+    for s in affordable[:30]:
+        print(f"  {s['id']:>5}  {s['name'][:42]:42s}  ${s['rate_per_1000']:>5.3f}  {s['max_qty']:>5}  ${s['cost']:.4f}")
+    if len(affordable) > 30:
+        print(f"  ... and {len(affordable) - 30} more (see {TELEGRAM_SERVICES_FILE})")
 
-    # Main loop
+    print()
+    link = input("Channel/Group link: ").strip()
+    if not link:
+        print("No link provided, exiting.")
+        return
+
+    qty_str = input("Target member quantity: ").strip()
+    try:
+        target_qty = int(qty_str)
+    except ValueError:
+        print("Invalid quantity.")
+        return
+
+    log(f"Link: {link}")
+    log(f"Target: {target_qty} members")
+
     last_proxy = None
     order_count = 0
 
     while running:
-        link, target_qty = get_user_input()
-        if link is None:
+        log(f"--- Order #{order_count + 1} ---")
+        last_proxy, ok = do_order(link, target_qty, affordable, last_proxy)
+        if ok:
+            order_count += 1
+        log(f"Total orders placed: {order_count}")
+
+        if not running:
             break
 
-        last_proxy = run_single_cycle(link, target_qty, last_proxy, affordable)
-        order_count += 1
-        print(f"\n--- Completed order #{order_count} ---")
+        print()
+        choice = input("[enter] next order  |  [a] autopilot (10 more)  |  [r] refresh prices  |  [q] quit: ").strip().lower()
+        if choice == "q":
+            break
+        elif choice == "r":
+            affordable = refresh_services()
+            print()
+            print(f"  Refreshed: {len(affordable)} affordable telegram services")
+            print(f"  {'ID':>5}  {'Service':42s}  {'$/1k':>7}  {'Qty':>5}  {'Cost':>8}")
+            print("  " + "-" * 75)
+            for s in affordable[:20]:
+                print(f"  {s['id']:>5}  {s['name'][:42]:42s}  ${s['rate_per_1000']:>5.3f}  {s['max_qty']:>5}  ${s['cost']:.4f}")
+        elif choice == "a":
+            autopilot_count = 10
+            log(f"Autopilot: {autopilot_count} orders...")
+            for i in range(autopilot_count):
+                if not running:
+                    break
+                log(f"Autopilot order {i+1}/{autopilot_count}")
+                last_proxy, ok = do_order(link, target_qty, affordable, last_proxy)
+                if ok:
+                    order_count += 1
+                log(f"Total: {order_count}")
+            log("Autopilot finished")
 
-    print(f"\n[*] Done. {order_count} orders placed.")
+    log(f"Done. {order_count} orders placed.")
+
 
 if __name__ == "__main__":
     main()
